@@ -38,15 +38,16 @@ import (
 	"github.com/external-secrets/external-secrets/providers/v1/vaultwarden/internal/crypto"
 )
 
-// vaultwardenCipher represents a vault item returned from /api/ciphers.
+// vaultwardenCipher represents a vault item returned from /api/ciphers or /api/sync.
 type vaultwardenCipher struct {
-	ID          string        `json:"id"`
-	Type        int           `json:"type"`        // 1=Login, 2=SecureNote
-	Name        string        `json:"name"`        // EncString
-	Notes       string        `json:"notes"`       // EncString (may be empty)
-	Login       *cipherLogin  `json:"login"`
-	Fields      []cipherField `json:"fields"`
-	DeletedDate any           `json:"deletedDate"`
+	ID             string        `json:"id"`
+	Type           int           `json:"type"`           // 1=Login, 2=SecureNote
+	Name           string        `json:"name"`           // EncString
+	Notes          string        `json:"notes"`          // EncString (may be empty)
+	Login          *cipherLogin  `json:"login"`
+	Fields         []cipherField `json:"fields"`
+	DeletedDate    interface{}   `json:"deletedDate"`
+	OrganizationID interface{}   `json:"organizationId"` // nil=personal, string UUID=org
 }
 
 type cipherLogin struct {
@@ -65,14 +66,60 @@ type ciphersListResponse struct {
 	Object string              `json:"object"`
 }
 
+// syncResponse is the relevant subset of GET /api/sync. We only need
+// the ciphers slice.
+type syncResponse struct {
+	Ciphers []vaultwardenCipher `json:"ciphers"`
+}
+
+// cipherOrgID extracts a cipher's organizationId as a string. The
+// Vaultwarden API returns either null or a UUID string; we normalize.
+func cipherOrgID(c vaultwardenCipher) string {
+	if c.OrganizationID == nil {
+		return ""
+	}
+	if s, ok := c.OrganizationID.(string); ok {
+		return s
+	}
+	return ""
+}
+
+// filterCiphersByScope keeps only Login + SecureNote ciphers in the
+// configured scope. orgID == "" means personal-only (org ciphers are
+// dropped). orgID != "" means only that org's ciphers (personal items
+// are dropped). Deleted ciphers are always dropped.
+func filterCiphersByScope(ciphers []vaultwardenCipher, orgID string) []vaultwardenCipher {
+	out := make([]vaultwardenCipher, 0, len(ciphers))
+	for _, c := range ciphers {
+		if c.DeletedDate != nil {
+			continue
+		}
+		if c.Type != 1 && c.Type != 2 {
+			continue
+		}
+		cOrg := cipherOrgID(c)
+		if orgID == "" {
+			if cOrg != "" {
+				continue
+			}
+		} else {
+			if cOrg != orgID {
+				continue
+			}
+		}
+		out = append(out, c)
+	}
+	return out
+}
+
 // cipherCreateBody is the JSON body for POST /api/ciphers and PUT /api/ciphers/{id}.
 type cipherCreateBody struct {
 	Type           int            `json:"type"`
 	Name           string         `json:"name"`
 	Notes          string         `json:"notes"`
 	SecureNote     *secureNoteObj `json:"secureNote,omitempty"`
-	FolderID       any            `json:"folderId"`
-	OrganizationID any            `json:"organizationId"`
+	FolderID       interface{}    `json:"folderId"`
+	OrganizationID interface{}    `json:"organizationId"`
 }
 
 type secureNoteObj struct {
@@ -94,6 +141,19 @@ type cachedToken struct {
 	// rsaPriv is held briefly while decrypting org keys. nil for
 	// personal-vault scope.
 	rsaPriv *rsa.PrivateKey
+}
+
+// keysFor returns the encryption + MAC keys to use for the given cipher
+// under the current scope. Because filterCiphersByScope guarantees a
+// single scope is visible per cachedToken, keysFor effectively returns
+// the personal keys when no org is configured and the org keys
+// otherwise. The cipher's organizationId is used as a tie-break only
+// if a future change relaxes the scope filter.
+func (t *cachedToken) keysFor(c vaultwardenCipher) (enc, mac []byte) {
+	if t.orgID != "" && cipherOrgID(c) == t.orgID {
+		return t.orgEncKey, t.orgMacKey
+	}
+	return t.symEncKey, t.symMacKey
 }
 
 // invalidate zeros all key material in place and clears the cached
@@ -132,29 +192,16 @@ type Client struct {
 
 var _ esv1.SecretsClient = &Client{}
 
+// bearerToken returns the Authorization header value for a given access token.
 const bearerPrefix = "Bearer "
 
-// pushMergePolicy controls what happens when PushSecret targets a cipher that already exists.
-type pushMergePolicy string
-
-const (
-	// mergePolicyReplace overwrites the existing cipher (default).
-	mergePolicyReplace pushMergePolicy = "Replace"
-	// mergePolicyError returns an error if the cipher already exists.
-	mergePolicyError pushMergePolicy = "Error"
-)
-
-// pushSecretMetadata is parsed from PushSecretData.GetMetadata().
-type pushSecretMetadata struct {
-	MergePolicy pushMergePolicy `json:"mergePolicy,omitempty"`
-}
-
-// Close is a no-op.
+// Close is a no-op; the HTTP client is reusable and has no per-session state.
 func (c *Client) Close(_ context.Context) error {
 	return nil
 }
 
-// Validate returns Unknown for ClusterSecretStore; otherwise authenticates and lists ciphers.
+// Validate checks whether the client can authenticate and list ciphers.
+// ClusterSecretStore cannot be validated (returns Unknown).
 func (c *Client) Validate() (esv1.ValidationResult, error) {
 	if c.store.GetObjectKind().GroupVersionKind().Kind == esv1.ClusterSecretStoreKind {
 		return esv1.ValidationResultUnknown, nil
@@ -176,7 +223,7 @@ func (c *Client) Validate() (esv1.ValidationResult, error) {
 // If ref.Property is set it looks up a named custom field; otherwise it returns
 // the decrypted notes (SecureNote) or password (Login).
 func (c *Client) GetSecret(ctx context.Context, ref esv1.ExternalSecretDataRemoteRef) ([]byte, error) {
-	accessToken, symEncKey, symMacKey, err := c.getSymKey(ctx)
+	accessToken, t, err := c.getToken(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -184,72 +231,72 @@ func (c *Client) GetSecret(ctx context.Context, ref esv1.ExternalSecretDataRemot
 	if err != nil {
 		return nil, err
 	}
-	cipher, err := findCipherByName(ciphers, ref.Key, symEncKey, symMacKey)
+	cipher, err := findCipherByName(ciphers, ref.Key, t)
 	if err != nil {
 		return nil, err
 	}
 	if ref.Property != "" {
-		return getCipherProperty(cipher, ref.Property, symEncKey, symMacKey)
+		return getCipherProperty(cipher, ref.Property, t)
 	}
-	return getCipherValue(cipher, ref.Key, symEncKey, symMacKey)
+	return getCipherValue(cipher, ref.Key, t)
 }
 
 // getCipherProperty looks up a named property from a cipher's custom fields,
 // falling back to the cipher's Notes JSON for secrets written by this provider.
-func getCipherProperty(cipher *vaultwardenCipher, property string, symEncKey, symMacKey []byte) ([]byte, error) {
+func getCipherProperty(cipher *vaultwardenCipher, property string, t *cachedToken) ([]byte, error) {
+	enc, mac := t.keysFor(*cipher)
 	for _, f := range cipher.Fields {
-		name, err := crypto.DecryptString(f.Name, symEncKey, symMacKey)
+		name, err := crypto.DecryptString(f.Name, enc, mac)
 		if err != nil {
 			continue
 		}
 		if name == property {
-			val, err := crypto.DecryptString(f.Value, symEncKey, symMacKey)
+			val, err := crypto.DecryptString(f.Value, enc, mac)
 			if err != nil {
 				return nil, fmt.Errorf("vaultwarden: decrypting field value: %w", err)
 			}
 			return []byte(val), nil
 		}
 	}
-	if v, err := getCipherPropertyFromNotes(cipher, property, symEncKey, symMacKey); err != nil {
-		return nil, err
-	} else if v != nil {
+	if v := getCipherPropertyFromNotes(cipher, property, t); v != nil {
 		return v, nil
 	}
 	return nil, fmt.Errorf("vaultwarden: field %q not found in secret %q", property, cipher.Name)
 }
 
-// getCipherPropertyFromNotes attempts to extract a property from the Notes JSON.
-// Returns (nil, nil) when Notes is empty or not a JSON object (property not present).
-func getCipherPropertyFromNotes(cipher *vaultwardenCipher, property string, symEncKey, symMacKey []byte) ([]byte, error) {
+// getCipherPropertyFromNotes attempts to extract a property from Notes JSON.
+func getCipherPropertyFromNotes(cipher *vaultwardenCipher, property string, t *cachedToken) []byte {
 	if cipher.Notes == "" {
-		return nil, nil
+		return nil
 	}
-	notes, err := crypto.DecryptString(cipher.Notes, symEncKey, symMacKey)
+	enc, mac := t.keysFor(*cipher)
+	notes, err := crypto.DecryptString(cipher.Notes, enc, mac)
 	if err != nil {
-		return nil, fmt.Errorf("vaultwarden: decrypting notes: %w", err)
+		return nil
 	}
 	var obj map[string]json.RawMessage
 	if json.Unmarshal([]byte(notes), &obj) != nil {
-		return nil, nil
+		return nil
 	}
 	if raw, ok := obj[property]; ok {
-		return jsonRawToBytes(raw), nil
+		return jsonRawToBytes(raw)
 	}
-	return nil, nil
+	return nil
 }
 
 // getCipherValue returns the primary value of a cipher:
 // Notes for SecureNote (type 2), password for Login (type 1).
-func getCipherValue(cipher *vaultwardenCipher, key string, symEncKey, symMacKey []byte) ([]byte, error) {
+func getCipherValue(cipher *vaultwardenCipher, key string, t *cachedToken) ([]byte, error) {
+	enc, mac := t.keysFor(*cipher)
 	if cipher.Type == 2 {
-		val, err := crypto.DecryptString(cipher.Notes, symEncKey, symMacKey)
+		val, err := crypto.DecryptString(cipher.Notes, enc, mac)
 		if err != nil {
 			return nil, fmt.Errorf("vaultwarden: decrypting notes: %w", err)
 		}
 		return []byte(val), nil
 	}
 	if cipher.Login != nil {
-		val, err := crypto.DecryptString(cipher.Login.Password, symEncKey, symMacKey)
+		val, err := crypto.DecryptString(cipher.Login.Password, enc, mac)
 		if err != nil {
 			return nil, fmt.Errorf("vaultwarden: decrypting password: %w", err)
 		}
@@ -260,7 +307,7 @@ func getCipherValue(cipher *vaultwardenCipher, key string, symEncKey, symMacKey 
 
 // GetSecretMap returns a map of keys to values by parsing the cipher's decrypted notes as JSON.
 func (c *Client) GetSecretMap(ctx context.Context, ref esv1.ExternalSecretDataRemoteRef) (map[string][]byte, error) {
-	accessToken, symEncKey, symMacKey, err := c.getSymKey(ctx)
+	accessToken, t, err := c.getToken(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -270,7 +317,7 @@ func (c *Client) GetSecretMap(ctx context.Context, ref esv1.ExternalSecretDataRe
 		return nil, err
 	}
 
-	cipher, err := findCipherByName(ciphers, ref.Key, symEncKey, symMacKey)
+	cipher, err := findCipherByName(ciphers, ref.Key, t)
 	if err != nil {
 		return nil, err
 	}
@@ -279,14 +326,15 @@ func (c *Client) GetSecretMap(ctx context.Context, ref esv1.ExternalSecretDataRe
 		return nil, fmt.Errorf("vaultwarden: secret %q has empty notes; cannot produce map", ref.Key)
 	}
 
-	notes, err := crypto.DecryptString(cipher.Notes, symEncKey, symMacKey)
+	enc, mac := t.keysFor(*cipher)
+	notes, err := crypto.DecryptString(cipher.Notes, enc, mac)
 	if err != nil {
 		return nil, fmt.Errorf("vaultwarden: decrypting notes for map: %w", err)
 	}
 
-	raw := make(map[string]json.RawMessage)
+	var raw map[string]json.RawMessage
 	if err := json.Unmarshal([]byte(notes), &raw); err != nil {
-		return nil, fmt.Errorf("vaultwarden: notes for %q are not a JSON object: %w", ref.Key, err)
+		return nil, fmt.Errorf("vaultwarden: notes for %q are not valid JSON: %w", ref.Key, err)
 	}
 
 	out := make(map[string][]byte, len(raw))
@@ -298,7 +346,7 @@ func (c *Client) GetSecretMap(ctx context.Context, ref esv1.ExternalSecretDataRe
 
 // GetAllSecrets returns all ciphers (optionally filtered by name regexp) as a name→value map.
 func (c *Client) GetAllSecrets(ctx context.Context, ref esv1.ExternalSecretFind) (map[string][]byte, error) {
-	accessToken, symEncKey, symMacKey, err := c.getSymKey(ctx)
+	accessToken, t, err := c.getToken(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -312,7 +360,7 @@ func (c *Client) GetAllSecrets(ctx context.Context, ref esv1.ExternalSecretFind)
 	}
 	out := make(map[string][]byte)
 	for i := range ciphers {
-		name, val, ok := decryptCipherEntry(&ciphers[i], nameRe, symEncKey, symMacKey)
+		name, val, ok := decryptCipherEntry(&ciphers[i], nameRe, t)
 		if ok {
 			out[name] = val
 		}
@@ -320,6 +368,7 @@ func (c *Client) GetAllSecrets(ctx context.Context, ref esv1.ExternalSecretFind)
 	return out, nil
 }
 
+// compileNameRegexp returns a compiled regexp from the find ref, or nil if none is set.
 func compileNameRegexp(ref esv1.ExternalSecretFind) (*regexp.Regexp, error) {
 	if ref.Name == nil || ref.Name.RegExp == "" {
 		return nil, nil
@@ -331,46 +380,40 @@ func compileNameRegexp(ref esv1.ExternalSecretFind) (*regexp.Regexp, error) {
 	return re, nil
 }
 
-// decryptCipherEntry returns (name, value, true) or ("", nil, false) if the entry should be skipped.
-func decryptCipherEntry(cipher *vaultwardenCipher, nameRe *regexp.Regexp, symEncKey, symMacKey []byte) (string, []byte, bool) {
+// decryptCipherEntry decrypts a cipher's name and value, applying the optional name filter.
+// Returns (name, value, true) on success or ("", nil, false) if the entry should be skipped.
+func decryptCipherEntry(cipher *vaultwardenCipher, nameRe *regexp.Regexp, t *cachedToken) (string, []byte, bool) {
 	if cipher.DeletedDate != nil {
 		return "", nil, false
 	}
-	name, err := crypto.DecryptString(cipher.Name, symEncKey, symMacKey)
+	enc, mac := t.keysFor(*cipher)
+	name, err := crypto.DecryptString(cipher.Name, enc, mac)
 	if err != nil || (nameRe != nil && !nameRe.MatchString(name)) {
 		return "", nil, false
 	}
-	val, err := decryptCipherPrimaryValue(cipher, symEncKey, symMacKey)
+	val, err := decryptCipherPrimaryValue(cipher, t)
 	if err != nil {
 		return "", nil, false
 	}
 	return name, []byte(val), true
 }
 
-func decryptCipherPrimaryValue(cipher *vaultwardenCipher, symEncKey, symMacKey []byte) (string, error) {
+// decryptCipherPrimaryValue returns the primary plaintext value of a cipher.
+func decryptCipherPrimaryValue(cipher *vaultwardenCipher, t *cachedToken) (string, error) {
+	enc, mac := t.keysFor(*cipher)
 	if cipher.Type == 2 {
-		return crypto.DecryptString(cipher.Notes, symEncKey, symMacKey)
+		return crypto.DecryptString(cipher.Notes, enc, mac)
 	}
 	if cipher.Login != nil {
-		return crypto.DecryptString(cipher.Login.Password, symEncKey, symMacKey)
+		return crypto.DecryptString(cipher.Login.Password, enc, mac)
 	}
 	return "", nil
 }
 
 // PushSecret writes a secret value to Vaultwarden as a SecureNote cipher.
-// Accepts optional metadata: {"mergePolicy":"Replace"} (default) or {"mergePolicy":"Error"}.
+// It creates the cipher if it doesn't exist, or updates it if it does.
 func (c *Client) PushSecret(ctx context.Context, secret *corev1.Secret, data esv1.PushSecretData) error {
-	var meta pushSecretMetadata
-	if m := data.GetMetadata(); m != nil {
-		if err := json.Unmarshal(m.Raw, &meta); err != nil {
-			return fmt.Errorf("vaultwarden: invalid push metadata: %w", err)
-		}
-	}
-	if meta.MergePolicy == "" {
-		meta.MergePolicy = mergePolicyReplace
-	}
-
-	accessToken, symEncKey, symMacKey, err := c.getSymKey(ctx)
+	accessToken, t, err := c.getToken(ctx)
 	if err != nil {
 		return err
 	}
@@ -379,7 +422,7 @@ func (c *Client) PushSecret(ctx context.Context, secret *corev1.Secret, data esv
 		return err
 	}
 	cipherName := data.GetRemoteKey()
-	bodyBytes, err := c.buildCipherBody(cipherName, string(value), symEncKey, symMacKey)
+	bodyBytes, err := c.buildCipherBody(cipherName, string(value), t)
 	if err != nil {
 		return err
 	}
@@ -387,10 +430,7 @@ func (c *Client) PushSecret(ctx context.Context, secret *corev1.Secret, data esv
 	if err != nil {
 		return err
 	}
-	existing := findCipherByNameNoErr(ciphers, cipherName, symEncKey, symMacKey)
-	if existing != nil && meta.MergePolicy == mergePolicyError {
-		return fmt.Errorf("vaultwarden: cipher %q already exists and mergePolicy is Error", cipherName)
-	}
+	existing := findCipherByNameNoErr(ciphers, cipherName, t)
 	return c.upsertCipher(ctx, accessToken, existing, bodyBytes)
 }
 
@@ -418,21 +458,34 @@ func buildPushValue(secret *corev1.Secret, data esv1.PushSecretData) ([]byte, er
 	return b, nil
 }
 
-func (c *Client) buildCipherBody(name, notes string, symEncKey, symMacKey []byte) ([]byte, error) {
-	encName, err := crypto.EncryptString(name, symEncKey, symMacKey)
+// buildCipherBody encrypts the cipher name and notes and serialises the body.
+// When t.orgID is set, the cipher is encrypted with the org's symkey and
+// tagged with the org's UUID so Vaultwarden stores it in the org vault.
+func (c *Client) buildCipherBody(name, notes string, t *cachedToken) ([]byte, error) {
+	// Pick encryption keys based on scope.
+	enc, mac := t.symEncKey, t.symMacKey
+	if t.orgID != "" {
+		enc, mac = t.orgEncKey, t.orgMacKey
+	}
+
+	encName, err := crypto.EncryptString(name, enc, mac)
 	if err != nil {
 		return nil, fmt.Errorf("vaultwarden: encrypting cipher name: %w", err)
 	}
-	encNotes, err := crypto.EncryptString(notes, symEncKey, symMacKey)
+	encNotes, err := crypto.EncryptString(notes, enc, mac)
 	if err != nil {
 		return nil, fmt.Errorf("vaultwarden: encrypting cipher notes: %w", err)
 	}
-	b, err := json.Marshal(cipherCreateBody{
+	body := cipherCreateBody{
 		Type:       2,
 		Name:       encName,
 		Notes:      encNotes,
 		SecureNote: &secureNoteObj{Type: 0},
-	})
+	}
+	if t.orgID != "" {
+		body.OrganizationID = t.orgID
+	}
+	b, err := json.Marshal(body)
 	if err != nil {
 		return nil, fmt.Errorf("vaultwarden: marshalling cipher body: %w", err)
 	}
@@ -440,7 +493,6 @@ func (c *Client) buildCipherBody(name, notes string, symEncKey, symMacKey []byte
 }
 
 // upsertCipher sends a PUT (update) or POST (create) request depending on whether existing is set.
-// API reference: https://bitwarden.com/help/vault-management-api/ and https://github.com/dani-garcia/vaultwarden/wiki
 func (c *Client) upsertCipher(ctx context.Context, accessToken string, existing *vaultwardenCipher, bodyBytes []byte) error {
 	base := strings.TrimRight(c.provider.URL, "/")
 	var method, url string
@@ -471,7 +523,7 @@ func (c *Client) upsertCipher(ctx context.Context, accessToken string, existing 
 
 // DeleteSecret deletes the cipher matching the remote ref's key. Idempotent — returns nil if not found.
 func (c *Client) DeleteSecret(ctx context.Context, remoteRef esv1.PushSecretRemoteRef) error {
-	accessToken, symEncKey, symMacKey, err := c.getSymKey(ctx)
+	accessToken, t, err := c.getToken(ctx)
 	if err != nil {
 		return err
 	}
@@ -481,8 +533,9 @@ func (c *Client) DeleteSecret(ctx context.Context, remoteRef esv1.PushSecretRemo
 		return err
 	}
 
-	cipher := findCipherByNameNoErr(ciphers, remoteRef.GetRemoteKey(), symEncKey, symMacKey)
+	cipher := findCipherByNameNoErr(ciphers, remoteRef.GetRemoteKey(), t)
 	if cipher == nil {
+		// Not found — idempotent delete.
 		return nil
 	}
 
@@ -508,7 +561,7 @@ func (c *Client) DeleteSecret(ctx context.Context, remoteRef esv1.PushSecretRemo
 
 // SecretExists returns true if a cipher with the given remote key name exists in the vault.
 func (c *Client) SecretExists(ctx context.Context, remoteRef esv1.PushSecretRemoteRef) (bool, error) {
-	accessToken, symEncKey, symMacKey, err := c.getSymKey(ctx)
+	accessToken, t, err := c.getToken(ctx)
 	if err != nil {
 		return false, err
 	}
@@ -518,52 +571,69 @@ func (c *Client) SecretExists(ctx context.Context, remoteRef esv1.PushSecretRemo
 		return false, err
 	}
 
-	cipher := findCipherByNameNoErr(ciphers, remoteRef.GetRemoteKey(), symEncKey, symMacKey)
+	cipher := findCipherByNameNoErr(ciphers, remoteRef.GetRemoteKey(), t)
 	return cipher != nil, nil
 }
 
+// listCiphersWithToken retrieves all ciphers via /api/sync and returns only
+// those in the configured scope (personal or a specific org).
 func (c *Client) listCiphersWithToken(ctx context.Context, accessToken string) ([]vaultwardenCipher, error) {
-	ciphersURL := strings.TrimRight(c.provider.URL, "/") + "/api/ciphers"
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, ciphersURL, nil)
+	url := strings.TrimRight(c.provider.URL, "/") + "/api/sync?excludeDomains=true"
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
-		return nil, fmt.Errorf("vaultwarden: building ciphers request: %w", err)
+		return nil, fmt.Errorf("vaultwarden: building sync request: %w", err)
 	}
 	req.Header.Set("Authorization", bearerPrefix+accessToken)
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("vaultwarden: ciphers request failed: %w", err)
+		return nil, fmt.Errorf("vaultwarden: sync: %w", err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("vaultwarden: ciphers endpoint returned HTTP %d", resp.StatusCode)
+		return nil, fmt.Errorf("vaultwarden: sync returned status %d", resp.StatusCode)
 	}
 
-	var list ciphersListResponse
-	if err := json.NewDecoder(resp.Body).Decode(&list); err != nil {
-		return nil, fmt.Errorf("vaultwarden: decoding ciphers response: %w", err)
+	var sync syncResponse
+	if err := json.NewDecoder(resp.Body).Decode(&sync); err != nil {
+		return nil, fmt.Errorf("vaultwarden: decoding sync: %w", err)
 	}
-	return list.Data, nil
+
+	orgID := c.cachedOrgID()
+	return filterCiphersByScope(sync.Ciphers, orgID), nil
 }
 
-// findCipherByName returns the matching cipher or esv1.NoSecretError.
+// cachedOrgID returns the orgID stored on the active cachedToken
+// (empty string for personal-vault scope). Reads under the existing
+// cache mutex.
+func (c *Client) cachedOrgID() string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.cache == nil {
+		return ""
+	}
+	return c.cache.orgID
+}
+
+// findCipherByName returns the first cipher whose decrypted name equals target.
 // Returns an error if not found.
-func findCipherByName(ciphers []vaultwardenCipher, target string, symEncKey, symMacKey []byte) (*vaultwardenCipher, error) {
-	c := findCipherByNameNoErr(ciphers, target, symEncKey, symMacKey)
+func findCipherByName(ciphers []vaultwardenCipher, target string, t *cachedToken) (*vaultwardenCipher, error) {
+	c := findCipherByNameNoErr(ciphers, target, t)
 	if c == nil {
 		return nil, fmt.Errorf("vaultwarden: secret %q not found", target)
 	}
 	return c, nil
 }
 
-// findCipherByNameNoErr is like findCipherByName but returns nil instead of an error.
-func findCipherByNameNoErr(ciphers []vaultwardenCipher, target string, symEncKey, symMacKey []byte) *vaultwardenCipher {
+// findCipherByNameNoErr returns the first cipher whose decrypted name equals target, or nil.
+func findCipherByNameNoErr(ciphers []vaultwardenCipher, target string, t *cachedToken) *vaultwardenCipher {
 	for i := range ciphers {
 		if ciphers[i].DeletedDate != nil {
 			continue
 		}
-		name, err := crypto.DecryptString(ciphers[i].Name, symEncKey, symMacKey)
+		enc, mac := t.keysFor(ciphers[i])
+		name, err := crypto.DecryptString(ciphers[i].Name, enc, mac)
 		if err != nil {
 			continue
 		}
