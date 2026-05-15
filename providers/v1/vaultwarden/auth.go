@@ -179,8 +179,18 @@ func (c *Client) fetchProfile(ctx context.Context, accessToken string) (*vaultwa
 	return &profile, nil
 }
 
-// getSymKey returns a cached or freshly derived access token and symmetric key material.
-// Expensive HTTP calls and key derivation happen outside the mutex lock.
+// getSymKey fetches (or returns a cached) access token and symmetric key material.
+// It authenticates with Vaultwarden, fetches the account profile, derives the master key,
+// and decrypts the user's symmetric encryption key. Results are cached for 5 minutes.
+//
+// The mutex is held only for the cache check and cache write; the expensive HTTP calls
+// and key derivation run outside the lock so concurrent reconciles are not serialized
+// behind network latency and crypto work.
+//
+//nolint:gocyclo // High cognitive complexity is acceptable here: this is the central
+// auth + key-derivation + (optional) org-key-unlock flow. Splitting it would push the
+// org branch into a helper that still needs every variable from this scope, hurting
+// readability without reducing surface area.
 func (c *Client) getSymKey(ctx context.Context) (accessToken string, symEncKey, symMacKey []byte, err error) {
 	c.mu.Lock()
 	if c.cache != nil && time.Now().Before(c.cache.expiresAt) {
