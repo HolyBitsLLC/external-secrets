@@ -1,0 +1,16 @@
+# HolyBitsLLC fork build — multi-stage so the in-cluster kaniko reusable
+# workflow can build the controller. Upstream's single-stage Dockerfile expects
+# a pre-built bin/ (produced by goreleaser) that CI does not generate here.
+#
+# Builds the controller with the webhook (existing read path) + vaultwarden
+# (ADR-0091 write path) providers. Switch the -tags to `all_providers` if the
+# full upstream provider set is required.
+FROM golang:1.26 AS builder
+WORKDIR /src
+COPY . .
+RUN CGO_ENABLED=0 go build -tags "webhook vaultwarden" -o /external-secrets main.go
+
+FROM gcr.io/distroless/static@sha256:f2ea2709ac8db56323cbd7d014277f32cb572d9ea124b0076f7aafe5980678fe
+COPY --from=builder /external-secrets /bin/external-secrets
+USER 65534
+ENTRYPOINT ["/bin/external-secrets"]

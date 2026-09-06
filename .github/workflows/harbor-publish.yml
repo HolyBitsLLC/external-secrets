@@ -1,0 +1,35 @@
+name: Build and Publish Harbor Image
+
+# Builds the forked external-secrets image (webhook + vaultwarden providers)
+# and publishes it to harbor.dittmanfamily.com/holybitsllc/external-secrets.
+#
+# push to main:  kaniko build → push sha-<commit> + main tags → gitops image bump
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  image:
+    name: Build and Push Container Image
+    uses: HolyBitsLLC/harvester-argo/.github/workflows/reusable-kaniko-build.yaml@main
+    with:
+      image: harbor.dittmanfamily.com/holybitsllc/external-secrets
+      dockerfile: Dockerfile.harbor
+      job-prefix: external-secrets
+      tags: 'sha-${{ github.sha }},main'
+      snapshot-mode: "time"
+
+  bump:
+    name: Open GitOps Image Bump PR
+    needs: [image]
+    uses: HolyBitsLLC/harvester-argo/.github/workflows/reusable-gitops-image-bump.yaml@main
+    with:
+      manifest_path: clusters/krubecible/components/external-secrets-config/eso-values.yaml
+      image_repo: harbor.dittmanfamily.com/holybitsllc/external-secrets
+      new_tag: sha-${{ github.sha }}
+    secrets: inherit
