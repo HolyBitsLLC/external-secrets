@@ -7649,7 +7649,8 @@ External Secrets meta/v1.SecretKeySelector
 </h3>
 <p>
 (<em>Appears on:</em>
-<a href="#external-secrets.io/v1.OnePasswordSDKProvider">OnePasswordSDKProvider</a>)
+<a href="#external-secrets.io/v1.OnePasswordSDKProvider">OnePasswordSDKProvider</a>, 
+<a href="#external-secrets.io/v1.VaultwardenProvider">VaultwardenProvider</a>)
 </p>
 <p>
 <p>CacheConfig configures client-side caching for read operations.</p>
@@ -19302,6 +19303,62 @@ organization by human-readable name. The provider resolves the name
 to a UUID at SecretStore validation time. Mutually exclusive with
 OrganizationID. Errors if zero or &gt;1 organizations the authenticated
 user belongs to match the name.</p>
+</td>
+</tr>
+<tr>
+<td>
+<code>collectionId</code></br>
+<em>
+string
+</em>
+</td>
+<td>
+<em>(Optional)</em>
+<p>CollectionID, if set, narrows the store to a single Vaultwarden
+collection by UUID, on top of the organization scope. Use this to
+address an item whose name is duplicated within the organization.
+Mutually exclusive with CollectionName, and requires organizationId or
+organizationName — collections are organization-scoped.</p>
+</td>
+</tr>
+<tr>
+<td>
+<code>collectionName</code></br>
+<em>
+string
+</em>
+</td>
+<td>
+<em>(Optional)</em>
+<p>CollectionName, if set, narrows the store to a single Vaultwarden
+collection by human-readable name, on top of the organization scope.
+The provider resolves the name to a UUID on each read and errors if zero
+or more than one collection in the organization matches, so an ambiguous
+name can never silently select a collection. Mutually exclusive with
+CollectionID, and requires organizationId or organizationName.</p>
+</td>
+</tr>
+<tr>
+<td>
+<code>cache</code></br>
+<em>
+<a href="#external-secrets.io/v1.CacheConfig">
+CacheConfig
+</a>
+</em>
+</td>
+<td>
+<em>(Optional)</em>
+<p>Cache configures client-side caching of resolved secret values for read
+operations (GetSecret, GetSecretMap).</p>
+<p>Caching is DISABLED unless this field is set: a cached value is stale for
+up to its TTL, and that is only safe while the TTL is shorter than the
+refreshInterval of every ExternalSecret consuming the store.</p>
+<p>The cache is per store version. Editing the store — or setting the
+external-secrets.io/force-sync annotation on it — drops the whole cache
+and therefore forces the next read to hit Vaultwarden. Write operations
+(PushSecret, DeleteSecret) invalidate the entry they touch.
+<code>cache: {}</code> is valid and uses the TTL/MaxSize defaults.</p>
 </td>
 </tr>
 <tr>
