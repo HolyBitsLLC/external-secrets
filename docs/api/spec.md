@@ -2208,7 +2208,8 @@ string
 <a href="#external-secrets.io/v1.OvhClientMTLS">OvhClientMTLS</a>, 
 <a href="#external-secrets.io/v1.PassboltProvider">PassboltProvider</a>, 
 <a href="#external-secrets.io/v1.SecretServerProvider">SecretServerProvider</a>, 
-<a href="#external-secrets.io/v1.VaultProvider">VaultProvider</a>)
+<a href="#external-secrets.io/v1.VaultProvider">VaultProvider</a>, 
+<a href="#external-secrets.io/v1.VaultwardenProvider">VaultwardenProvider</a>)
 </p>
 <p>
 <p>CAProvider provides a custom certificate authority for accessing the provider&rsquo;s store.
@@ -2640,7 +2641,8 @@ External Secrets meta/v1.SecretKeySelector
 </h3>
 <p>
 (<em>Appears on:</em>
-<a href="#external-secrets.io/v1.OnePasswordSDKProvider">OnePasswordSDKProvider</a>)
+<a href="#external-secrets.io/v1.OnePasswordSDKProvider">OnePasswordSDKProvider</a>, 
+<a href="#external-secrets.io/v1.VaultwardenProvider">VaultwardenProvider</a>)
 </p>
 <p>
 <p>CacheConfig configures client-side caching for read operations.</p>
@@ -11266,6 +11268,20 @@ VaultProvider
 </tr>
 <tr>
 <td>
+<code>vaultwarden</code></br>
+<em>
+<a href="#external-secrets.io/v1.VaultwardenProvider">
+VaultwardenProvider
+</a>
+</em>
+</td>
+<td>
+<em>(Optional)</em>
+<p>Vaultwarden configures this store to sync secrets from a self-hosted Vaultwarden instance.</p>
+</td>
+</tr>
+<tr>
+<td>
 <code>ovh</code></br>
 <em>
 <a href="#external-secrets.io/v1.OvhProvider">
@@ -14174,6 +14190,253 @@ External Secrets meta/v1.SecretKeySelector
 <p>SecretRef to a key in a Secret resource containing password for the
 user used to authenticate with Vault using the UserPass authentication
 method</p>
+</td>
+</tr>
+</tbody>
+</table>
+<h3 id="external-secrets.io/v1.VaultwardenAuth">VaultwardenAuth
+</h3>
+<p>
+(<em>Appears on:</em>
+<a href="#external-secrets.io/v1.VaultwardenProvider">VaultwardenProvider</a>)
+</p>
+<p>
+<p>VaultwardenAuth holds references to the Kubernetes secrets containing Vaultwarden credentials.</p>
+</p>
+<table>
+<thead>
+<tr>
+<th>Field</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>
+<code>secretRef</code></br>
+<em>
+<a href="#external-secrets.io/v1.VaultwardenSecretRef">
+VaultwardenSecretRef
+</a>
+</em>
+</td>
+<td>
+</td>
+</tr>
+</tbody>
+</table>
+<h3 id="external-secrets.io/v1.VaultwardenProvider">VaultwardenProvider
+</h3>
+<p>
+(<em>Appears on:</em>
+<a href="#external-secrets.io/v1.SecretStoreProvider">SecretStoreProvider</a>)
+</p>
+<p>
+<p>VaultwardenProvider configures a store to sync secrets with a self-hosted Vaultwarden instance.</p>
+</p>
+<table>
+<thead>
+<tr>
+<th>Field</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>
+<code>url</code></br>
+<em>
+string
+</em>
+</td>
+<td>
+<p>URL is the base URL of the Vaultwarden instance, e.g. <a href="https://vault.example.com">https://vault.example.com</a></p>
+</td>
+</tr>
+<tr>
+<td>
+<code>auth</code></br>
+<em>
+<a href="#external-secrets.io/v1.VaultwardenAuth">
+VaultwardenAuth
+</a>
+</em>
+</td>
+<td>
+<p>Auth configures how ESO authenticates with Vaultwarden using a personal API key.</p>
+</td>
+</tr>
+<tr>
+<td>
+<code>organizationId</code></br>
+<em>
+string
+</em>
+</td>
+<td>
+<em>(Optional)</em>
+<p>OrganizationID, if set, scopes this store to a single Vaultwarden
+organization by UUID. Mutually exclusive with OrganizationName.
+When both OrganizationID and OrganizationName are empty, the store
+operates on the user&rsquo;s personal vault only.</p>
+</td>
+</tr>
+<tr>
+<td>
+<code>organizationName</code></br>
+<em>
+string
+</em>
+</td>
+<td>
+<em>(Optional)</em>
+<p>OrganizationName, if set, scopes this store to a single Vaultwarden
+organization by human-readable name. The provider resolves the name
+to a UUID at SecretStore validation time. Mutually exclusive with
+OrganizationID. Errors if zero or &gt;1 organizations the authenticated
+user belongs to match the name.</p>
+</td>
+</tr>
+<tr>
+<td>
+<code>collectionId</code></br>
+<em>
+string
+</em>
+</td>
+<td>
+<em>(Optional)</em>
+<p>CollectionID, if set, narrows the store to a single Vaultwarden
+collection by UUID, on top of the organization scope. Use this to
+address an item whose name is duplicated within the organization.
+Mutually exclusive with CollectionName, and requires organizationId or
+organizationName — collections are organization-scoped.</p>
+</td>
+</tr>
+<tr>
+<td>
+<code>collectionName</code></br>
+<em>
+string
+</em>
+</td>
+<td>
+<em>(Optional)</em>
+<p>CollectionName, if set, narrows the store to a single Vaultwarden
+collection by human-readable name, on top of the organization scope.
+The provider resolves the name to a UUID on each read and errors if zero
+or more than one collection in the organization matches, so an ambiguous
+name can never silently select a collection. Mutually exclusive with
+CollectionID, and requires organizationId or organizationName.</p>
+</td>
+</tr>
+<tr>
+<td>
+<code>cache</code></br>
+<em>
+<a href="#external-secrets.io/v1.CacheConfig">
+CacheConfig
+</a>
+</em>
+</td>
+<td>
+<em>(Optional)</em>
+<p>Cache configures client-side caching of resolved secret values for read
+operations (GetSecret, GetSecretMap).</p>
+<p>Caching is DISABLED unless this field is set: a cached value is stale for
+up to its TTL, and that is only safe while the TTL is shorter than the
+refreshInterval of every ExternalSecret consuming the store.</p>
+<p>The cache is per store version. Editing the store — or setting the
+external-secrets.io/force-sync annotation on it — drops the whole cache
+and therefore forces the next read to hit Vaultwarden. Write operations
+(PushSecret, DeleteSecret) invalidate the entry they touch.
+<code>cache: {}</code> is valid and uses the TTL/MaxSize defaults.</p>
+</td>
+</tr>
+<tr>
+<td>
+<code>caBundle</code></br>
+<em>
+[]byte
+</em>
+</td>
+<td>
+<em>(Optional)</em>
+<p>CABundle is a PEM-encoded CA certificate bundle used to validate the Vaultwarden server certificate.
+If omitted, the system CA pool is used.</p>
+</td>
+</tr>
+<tr>
+<td>
+<code>caProvider</code></br>
+<em>
+<a href="#external-secrets.io/v1.CAProvider">
+CAProvider
+</a>
+</em>
+</td>
+<td>
+<em>(Optional)</em>
+<p>CAProvider references a Secret or ConfigMap key that holds a PEM CA bundle.
+Takes precedence over CABundle when both are set.</p>
+</td>
+</tr>
+</tbody>
+</table>
+<h3 id="external-secrets.io/v1.VaultwardenSecretRef">VaultwardenSecretRef
+</h3>
+<p>
+(<em>Appears on:</em>
+<a href="#external-secrets.io/v1.VaultwardenAuth">VaultwardenAuth</a>)
+</p>
+<p>
+<p>VaultwardenSecretRef contains selectors for the three credentials needed to access Vaultwarden.</p>
+</p>
+<table>
+<thead>
+<tr>
+<th>Field</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>
+<code>clientID</code></br>
+<em>
+<a href="https://pkg.go.dev/github.com/external-secrets/external-secrets/apis/meta/v1#SecretKeySelector">
+External Secrets meta/v1.SecretKeySelector
+</a>
+</em>
+</td>
+<td>
+<p>ClientID is the OAuth2 client_id of the Vaultwarden personal API key.</p>
+</td>
+</tr>
+<tr>
+<td>
+<code>clientSecret</code></br>
+<em>
+<a href="https://pkg.go.dev/github.com/external-secrets/external-secrets/apis/meta/v1#SecretKeySelector">
+External Secrets meta/v1.SecretKeySelector
+</a>
+</em>
+</td>
+<td>
+<p>ClientSecret is the OAuth2 client_secret of the Vaultwarden personal API key.</p>
+</td>
+</tr>
+<tr>
+<td>
+<code>masterPassword</code></br>
+<em>
+<a href="https://pkg.go.dev/github.com/external-secrets/external-secrets/apis/meta/v1#SecretKeySelector">
+External Secrets meta/v1.SecretKeySelector
+</a>
+</em>
+</td>
+<td>
+<p>MasterPassword is the Vaultwarden account master password used to decrypt vault items.</p>
 </td>
 </tr>
 </tbody>
