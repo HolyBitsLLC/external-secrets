@@ -32,13 +32,21 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
 
 	esv1 "github.com/external-secrets/external-secrets/apis/externalsecrets/v1"
+	"github.com/external-secrets/external-secrets/runtime/cache"
 	"github.com/external-secrets/external-secrets/runtime/esutils"
 )
 
 const errUnexpectedStoreSpec = "unexpected store spec"
 
 // Provider implements esv1.Provider for Vaultwarden.
-type Provider struct{}
+//
+// The provider is a process-lifetime singleton (see NewProvider) and holds one
+// piece of state: a client cache that keeps a Vaultwarden Client — and with it
+// the store's auth token and value cache — alive across reconciles for as long
+// as the store's resourceVersion is unchanged.
+type Provider struct {
+	clientCache *cache.Cache[esv1.SecretsClient]
+}
 
 var _ esv1.Provider = &Provider{}
 
@@ -47,17 +55,39 @@ func (p *Provider) Capabilities() esv1.SecretStoreCapabilities {
 	return esv1.SecretStoreReadWrite
 }
 
-// NewClient constructs a new secrets client based on the provided store.
+// NewClient constructs a new secrets client based on the provided store, or
+// returns the cached one when the store has not changed since it was built.
+//
+// Caching the client is what makes the value cache useful and what gives the
+// refresh control its teeth: the cache key carries the store's resourceVersion
+// and its force-sync annotation (cacheVersion), so editing the store — or
+// touching that annotation — is guaranteed to build a fresh Client with an
+// empty value cache, while an untouched store reuses its token.
 func (p *Provider) NewClient(ctx context.Context, store esv1.GenericStore, kube client.Client, namespace string) (esv1.SecretsClient, error) {
 	prov, err := getProvider(store)
 	if err != nil {
 		return nil, err
 	}
+
+	// Providers built by NewProvider always have a cache. A zero-valued Provider
+	// (tests) simply does not cache rather than panicking.
+	if p.clientCache != nil {
+		key := cache.Key{
+			Name:      store.GetObjectMeta().GetName(),
+			Namespace: store.GetObjectMeta().GetNamespace(),
+			Kind:      store.GetObjectKind().GroupVersionKind().Kind,
+		}
+		if cached, ok := p.clientCache.Get(cacheVersion(store), key); ok {
+			return cached, nil
+		}
+	}
+
 	c := &Client{
-		provider:  prov,
-		crClient:  kube,
-		namespace: namespace,
-		store:     store,
+		provider:    prov,
+		crClient:    kube,
+		namespace:   namespace,
+		store:       store,
+		secretCache: newSecretCache(prov.Cache),
 	}
 	// Resolve a CAProvider reference (Secret/ConfigMap) into CA bytes so
 	// initHTTPClient can trust self-signed certs. CAProvider takes
@@ -76,6 +106,14 @@ func (p *Provider) NewClient(ctx context.Context, store esv1.GenericStore, kube 
 	}
 	if err := c.initHTTPClient(); err != nil {
 		return nil, err
+	}
+	if p.clientCache != nil {
+		key := cache.Key{
+			Name:      store.GetObjectMeta().GetName(),
+			Namespace: store.GetObjectMeta().GetNamespace(),
+			Kind:      store.GetObjectKind().GroupVersionKind().Kind,
+		}
+		p.clientCache.Add(cacheVersion(store), key, c)
 	}
 	return c, nil
 }
@@ -123,11 +161,31 @@ func (p *Provider) ValidateStore(store esv1.GenericStore) (admission.Warnings, e
 	if vw.OrganizationID != "" && vw.OrganizationName != "" {
 		return admission.Warnings{}, errors.New("vaultwarden: organizationId and organizationName are mutually exclusive; set at most one")
 	}
+	if vw.CollectionID != "" && vw.CollectionName != "" {
+		return admission.Warnings{}, errors.New("vaultwarden: collectionId and collectionName are mutually exclusive; set at most one")
+	}
+	// Collections are organization-scoped: a collection scope without an
+	// organization scope can never resolve, so reject it at admission rather
+	// than failing every read later.
+	if (vw.CollectionID != "" || vw.CollectionName != "") &&
+		vw.OrganizationID == "" && vw.OrganizationName == "" {
+		return admission.Warnings{}, errors.New("vaultwarden: collectionId/collectionName require organizationId or organizationName; collections are organization-scoped")
+	}
+	if vw.Cache != nil {
+		if vw.Cache.MaxSize < 0 {
+			return admission.Warnings{}, errors.New("vaultwarden: cache.maxSize must not be negative")
+		}
+		if vw.Cache.TTL.Duration < 0 {
+			return admission.Warnings{}, errors.New("vaultwarden: cache.ttl must not be negative")
+		}
+	}
 	return nil, nil
 }
 
 func NewProvider() esv1.Provider {
-	return &Provider{}
+	return &Provider{
+		clientCache: newClientCache(),
+	}
 }
 
 func ProviderSpec() *esv1.SecretStoreProvider {

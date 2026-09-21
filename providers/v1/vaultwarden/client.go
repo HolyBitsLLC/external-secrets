@@ -26,10 +26,12 @@ import (
 	"fmt"
 	"net/http"
 	"regexp"
+	"sort"
 	"strings"
 	"sync"
 	"time"
 
+	lru "github.com/hashicorp/golang-lru/v2/expirable"
 	corev1 "k8s.io/api/core/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
@@ -40,13 +42,16 @@ import (
 // vaultwardenCipher represents a vault item returned from /api/ciphers or /api/sync.
 type vaultwardenCipher struct {
 	ID             string        `json:"id"`
-	Type           int           `json:"type"`           // 1=Login, 2=SecureNote
-	Name           string        `json:"name"`           // EncString
-	Notes          string        `json:"notes"`          // EncString (may be empty)
+	Type           int           `json:"type"`  // 1=Login, 2=SecureNote
+	Name           string        `json:"name"`  // EncString
+	Notes          string        `json:"notes"` // EncString (may be empty)
 	Login          *cipherLogin  `json:"login"`
 	Fields         []cipherField `json:"fields"`
 	DeletedDate    interface{}   `json:"deletedDate"`
 	OrganizationID interface{}   `json:"organizationId"` // nil=personal, string UUID=org
+	// CollectionIDs are the organization collections this item belongs to.
+	// Null/absent for personal items.
+	CollectionIDs []string `json:"collectionIds"`
 }
 
 type cipherLogin struct {
@@ -65,10 +70,12 @@ type ciphersListResponse struct {
 	Object string              `json:"object"`
 }
 
-// syncResponse is the relevant subset of GET /api/sync. We only need
-// the ciphers slice.
+// syncResponse is the relevant subset of GET /api/sync: the cipher slice plus
+// the collections the user can access, which is what lets a collection name be
+// resolved to a UUID without a second round trip.
 type syncResponse struct {
-	Ciphers []vaultwardenCipher `json:"ciphers"`
+	Ciphers     []vaultwardenCipher `json:"ciphers"`
+	Collections []collectionEntry   `json:"collections"`
 }
 
 // cipherOrgID extracts a cipher's organizationId as a string. The
@@ -187,6 +194,11 @@ type Client struct {
 
 	mu    sync.Mutex
 	cache *cachedToken
+
+	// secretCache holds resolved secret values. It is nil unless the store sets
+	// spec.provider.vaultwarden.cache. Guarded internally by the LRU; the
+	// cached-token mutex above is unrelated.
+	secretCache *lru.LRU[string, []byte]
 }
 
 var _ esv1.SecretsClient = &Client{}
@@ -194,7 +206,13 @@ var _ esv1.SecretsClient = &Client{}
 // bearerToken returns the Authorization header value for a given access token.
 const bearerPrefix = "Bearer "
 
-// Close is a no-op; the HTTP client is reusable and has no per-session state.
+// Close is a no-op: the HTTP client is reusable and has no per-session state.
+//
+// It MUST stay a no-op. ESO's client manager calls Close on every client it
+// handed out at the end of each reconcile (secretstore.Manager.Close), but the
+// provider keeps this same Client in its provider-level cache across reconciles
+// so the value cache survives. Tearing anything down here would silently defeat
+// that cache on every reconcile.
 func (c *Client) Close(_ context.Context) error {
 	return nil
 }
@@ -221,7 +239,16 @@ func (c *Client) Validate() (esv1.ValidationResult, error) {
 // GetSecret returns a single secret value by cipher name (ref.Key).
 // If ref.Property is set it looks up a named custom field; otherwise it returns
 // the decrypted notes (SecureNote) or password (Login).
+//
+// When the store enables spec.provider.vaultwarden.cache, the resolved value is
+// cached for the configured TTL, keyed by (item, kind, property) — see cache.go
+// for why the store identity and scope are structurally implicit in that key.
 func (c *Client) GetSecret(ctx context.Context, ref esv1.ExternalSecretDataRemoteRef) ([]byte, error) {
+	cacheKey := secretCacheKey(ref.Key, cacheKindSecret, ref.Property)
+	if v, ok := c.cacheGet(cacheKey); ok {
+		return v, nil
+	}
+
 	accessToken, t, err := c.getToken(ctx)
 	if err != nil {
 		return nil, err
@@ -234,10 +261,17 @@ func (c *Client) GetSecret(ctx context.Context, ref esv1.ExternalSecretDataRemot
 	if err != nil {
 		return nil, err
 	}
+	var out []byte
 	if ref.Property != "" {
-		return getCipherProperty(cipher, ref.Property, t)
+		out, err = getCipherProperty(cipher, ref.Property, t)
+	} else {
+		out, err = getCipherValue(cipher, ref.Key, t)
 	}
-	return getCipherValue(cipher, ref.Key, t)
+	if err != nil {
+		return nil, err
+	}
+	c.cacheAdd(cacheKey, out)
+	return out, nil
 }
 
 // getCipherProperty looks up a named property from a cipher's custom fields,
@@ -305,7 +339,14 @@ func getCipherValue(cipher *vaultwardenCipher, key string, t *cachedToken) ([]by
 }
 
 // GetSecretMap returns a map of keys to values by parsing the cipher's decrypted notes as JSON.
+// The whole map is cached as one entry (cacheKindMap). ref.Property is ignored
+// by this provider, so it is not part of the cache key.
 func (c *Client) GetSecretMap(ctx context.Context, ref esv1.ExternalSecretDataRemoteRef) (map[string][]byte, error) {
+	cacheKey := secretCacheKey(ref.Key, cacheKindMap, "")
+	if m, ok := c.cacheGetMap(cacheKey); ok {
+		return m, nil
+	}
+
 	accessToken, t, err := c.getToken(ctx)
 	if err != nil {
 		return nil, err
@@ -340,6 +381,7 @@ func (c *Client) GetSecretMap(ctx context.Context, ref esv1.ExternalSecretDataRe
 	for k, v := range raw {
 		out[k] = jsonRawToBytes(v)
 	}
+	c.cacheAddMap(cacheKey, out)
 	return out, nil
 }
 
@@ -410,7 +452,9 @@ func decryptCipherPrimaryValue(cipher *vaultwardenCipher, t *cachedToken) (strin
 }
 
 // PushSecret writes a secret value to Vaultwarden as a SecureNote cipher.
-// It creates the cipher if it doesn't exist, or updates it if it does.
+// It creates the cipher if it doesn't exist, or updates it if it does. An
+// ambiguous name (more than one item with that name in scope) is an error so the
+// wrong item is never overwritten.
 func (c *Client) PushSecret(ctx context.Context, secret *corev1.Secret, data esv1.PushSecretData) error {
 	accessToken, t, err := c.getToken(ctx)
 	if err != nil {
@@ -429,8 +473,20 @@ func (c *Client) PushSecret(ctx context.Context, secret *corev1.Secret, data esv
 	if err != nil {
 		return err
 	}
-	existing := findCipherByNameNoErr(ciphers, cipherName, t)
-	return c.upsertCipher(ctx, accessToken, existing, bodyBytes)
+	existing, err := findUniqueCipherByName(ciphers, cipherName, t)
+	if err != nil {
+		return err
+	}
+	if err := c.upsertCipher(ctx, accessToken, existing, bodyBytes); err != nil {
+		return err
+	}
+	// A write invalidates every cached read of the item it touched, so a push
+	// followed by a read in the same window cannot serve the pre-write value.
+	c.invalidateItem(cipherName)
+	if existing != nil && existing.ID != cipherName {
+		c.invalidateItem(existing.ID)
+	}
+	return nil
 }
 
 // buildPushValue extracts the value to push from the Kubernetes secret.
@@ -519,7 +575,9 @@ func (c *Client) upsertCipher(ctx context.Context, accessToken string, existing 
 	return nil
 }
 
-// DeleteSecret deletes the cipher matching the remote ref's key. Idempotent — returns nil if not found.
+// DeleteSecret deletes the cipher matching the remote ref's key. Idempotent —
+// returns nil if not found. An ambiguous name is an error: a delete must never
+// guess which of several duplicates the caller meant.
 func (c *Client) DeleteSecret(ctx context.Context, remoteRef esv1.PushSecretRemoteRef) error {
 	accessToken, t, err := c.getToken(ctx)
 	if err != nil {
@@ -531,7 +589,10 @@ func (c *Client) DeleteSecret(ctx context.Context, remoteRef esv1.PushSecretRemo
 		return err
 	}
 
-	cipher := findCipherByNameNoErr(ciphers, remoteRef.GetRemoteKey(), t)
+	cipher, err := findUniqueCipherByName(ciphers, remoteRef.GetRemoteKey(), t)
+	if err != nil {
+		return err
+	}
 	if cipher == nil {
 		// Not found — idempotent delete.
 		return nil
@@ -553,10 +614,13 @@ func (c *Client) DeleteSecret(ctx context.Context, remoteRef esv1.PushSecretRemo
 	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusNoContent {
 		return fmt.Errorf("vaultwarden: delete cipher returned HTTP %d", resp.StatusCode)
 	}
+	c.invalidateItem(remoteRef.GetRemoteKey())
+	c.invalidateItem(cipher.ID)
 	return nil
 }
 
 // SecretExists returns true if a cipher with the given remote key name exists in the vault.
+// An ambiguous name is an error rather than an arbitrary true/false.
 func (c *Client) SecretExists(ctx context.Context, remoteRef esv1.PushSecretRemoteRef) (bool, error) {
 	accessToken, t, err := c.getToken(ctx)
 	if err != nil {
@@ -568,12 +632,20 @@ func (c *Client) SecretExists(ctx context.Context, remoteRef esv1.PushSecretRemo
 		return false, err
 	}
 
-	cipher := findCipherByNameNoErr(ciphers, remoteRef.GetRemoteKey(), t)
+	cipher, err := findUniqueCipherByName(ciphers, remoteRef.GetRemoteKey(), t)
+	if err != nil {
+		return false, err
+	}
 	return cipher != nil, nil
 }
 
 // listCiphersWithToken retrieves all ciphers via /api/sync and returns only
-// those in the configured scope (personal or a specific org).
+// those in the configured scope (personal, one org, and — when configured — one
+// collection within that org).
+//
+// The collection name→UUID resolution also happens here because /api/sync is
+// the only call that returns the collection list, so a collection scope costs
+// no extra request.
 func (c *Client) listCiphersWithToken(ctx context.Context, accessToken string) ([]vaultwardenCipher, error) {
 	url := strings.TrimRight(c.provider.URL, "/") + "/api/sync?excludeDomains=true"
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
@@ -598,7 +670,12 @@ func (c *Client) listCiphersWithToken(ctx context.Context, accessToken string) (
 	}
 
 	orgID := c.cachedOrgID()
-	return filterCiphersByScope(sync.Ciphers, orgID), nil
+	collectionID, err := resolveCollectionID(sync.Collections, c.provider, orgID)
+	if err != nil {
+		return nil, err
+	}
+	scoped := filterCiphersByScope(sync.Ciphers, orgID)
+	return filterCiphersByCollection(scoped, collectionID), nil
 }
 
 // cachedOrgID returns the orgID stored on the active cachedToken
@@ -613,32 +690,98 @@ func (c *Client) cachedOrgID() string {
 	return c.cache.orgID
 }
 
-// findCipherByName returns the first cipher whose decrypted name equals target.
-// Returns an error if not found.
-func findCipherByName(ciphers []vaultwardenCipher, target string, t *cachedToken) (*vaultwardenCipher, error) {
-	c := findCipherByNameNoErr(ciphers, target, t)
-	if c == nil {
-		return nil, fmt.Errorf("vaultwarden: secret %q not found", target)
+// cipherName decrypts a cipher's name. ok is false for deleted items and for
+// any item whose name does not decrypt under the active scope's keys.
+func cipherName(c *vaultwardenCipher, t *cachedToken) (string, bool) {
+	if c.DeletedDate != nil {
+		return "", false
 	}
-	return c, nil
+	enc, mac := t.keysFor(*c)
+	name, err := crypto.DecryptString(c.Name, enc, mac)
+	if err != nil {
+		return "", false
+	}
+	return name, true
 }
 
-// findCipherByNameNoErr returns the first cipher whose decrypted name equals target, or nil.
-func findCipherByNameNoErr(ciphers []vaultwardenCipher, target string, t *cachedToken) *vaultwardenCipher {
+// findCipherByID returns the cipher with the given UUID, or nil. Item ids are
+// addressable so that a duplicated name stays resolvable.
+func findCipherByID(ciphers []vaultwardenCipher, id string) *vaultwardenCipher {
 	for i := range ciphers {
-		if ciphers[i].DeletedDate != nil {
-			continue
-		}
-		enc, mac := t.keysFor(ciphers[i])
-		name, err := crypto.DecryptString(ciphers[i].Name, enc, mac)
-		if err != nil {
-			continue
-		}
-		if name == target {
+		if ciphers[i].DeletedDate == nil && ciphers[i].ID == id {
 			return &ciphers[i]
 		}
 	}
 	return nil
+}
+
+// findCiphersByName returns every cipher whose decrypted name equals target,
+// sorted by id so callers and tests see a deterministic order.
+func findCiphersByName(ciphers []vaultwardenCipher, target string, t *cachedToken) []*vaultwardenCipher {
+	var out []*vaultwardenCipher
+	for i := range ciphers {
+		if name, ok := cipherName(&ciphers[i], t); ok && name == target {
+			out = append(out, &ciphers[i])
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
+	return out
+}
+
+// ambiguousRefError is returned when a reference matches more than one item in
+// the store's resolved scope. The wording follows ESO's own findSecretByRef
+// convention ("more than one secret found for ..."), and the candidate ids let
+// the caller disambiguate instead of guessing.
+func ambiguousRefError(target string, matches []*vaultwardenCipher) error {
+	ids := make([]string, 0, len(matches))
+	for _, m := range matches {
+		ids = append(ids, m.ID)
+	}
+	sort.Strings(ids)
+	return fmt.Errorf("vaultwarden: more than one secret found for key %q (candidates: %s); narrow the store scope with collectionId/collectionName, or use one of the candidate ids as remoteRef.key",
+		target, strings.Join(ids, ", "))
+}
+
+// findCipherByName resolves a read ref to exactly one cipher.
+//
+// Resolution order:
+//  1. an exact match on the cipher UUID, so a duplicate that cannot be renamed
+//     is still addressable deterministically;
+//  2. an exact match on the decrypted item name.
+//
+// A name matching more than one cipher in scope is an error listing the
+// candidate ids — never a silent first-match win.
+func findCipherByName(ciphers []vaultwardenCipher, target string, t *cachedToken) (*vaultwardenCipher, error) {
+	if c := findCipherByID(ciphers, target); c != nil {
+		return c, nil
+	}
+	matches := findCiphersByName(ciphers, target, t)
+	switch len(matches) {
+	case 0:
+		return nil, fmt.Errorf("vaultwarden: secret %q not found", target)
+	case 1:
+		return matches[0], nil
+	default:
+		return nil, ambiguousRefError(target, matches)
+	}
+}
+
+// findUniqueCipherByName is the write-path counterpart. nil, nil means "no such
+// item" (idempotent delete, or create-on-push). More than one match is an error
+// so a mutating call can never pick the wrong duplicate to overwrite or delete.
+func findUniqueCipherByName(ciphers []vaultwardenCipher, target string, t *cachedToken) (*vaultwardenCipher, error) {
+	if c := findCipherByID(ciphers, target); c != nil {
+		return c, nil
+	}
+	matches := findCiphersByName(ciphers, target, t)
+	switch len(matches) {
+	case 0:
+		return nil, nil
+	case 1:
+		return matches[0], nil
+	default:
+		return nil, ambiguousRefError(target, matches)
+	}
 }
 
 // jsonRawToBytes converts a json.RawMessage to []byte.

@@ -40,6 +40,35 @@ type VaultwardenProvider struct {
 	// user belongs to match the name.
 	// +optional
 	OrganizationName string `json:"organizationName,omitempty"`
+	// CollectionID, if set, narrows the store to a single Vaultwarden
+	// collection by UUID, on top of the organization scope. Use this to
+	// address an item whose name is duplicated within the organization.
+	// Mutually exclusive with CollectionName, and requires organizationId or
+	// organizationName — collections are organization-scoped.
+	// +optional
+	CollectionID string `json:"collectionId,omitempty"`
+	// CollectionName, if set, narrows the store to a single Vaultwarden
+	// collection by human-readable name, on top of the organization scope.
+	// The provider resolves the name to a UUID on each read and errors if zero
+	// or more than one collection in the organization matches, so an ambiguous
+	// name can never silently select a collection. Mutually exclusive with
+	// CollectionID, and requires organizationId or organizationName.
+	// +optional
+	CollectionName string `json:"collectionName,omitempty"`
+	// Cache configures client-side caching of resolved secret values for read
+	// operations (GetSecret, GetSecretMap).
+	//
+	// Caching is DISABLED unless this field is set: a cached value is stale for
+	// up to its TTL, and that is only safe while the TTL is shorter than the
+	// refreshInterval of every ExternalSecret consuming the store.
+	//
+	// The cache is per store version. Editing the store — or setting the
+	// external-secrets.io/force-sync annotation on it — drops the whole cache
+	// and therefore forces the next read to hit Vaultwarden. Write operations
+	// (PushSecret, DeleteSecret) invalidate the entry they touch.
+	// `cache: {}` is valid and uses the TTL/MaxSize defaults.
+	// +optional
+	Cache *CacheConfig `json:"cache,omitempty"`
 	// CABundle is a PEM-encoded CA certificate bundle used to validate the Vaultwarden server certificate.
 	// If omitted, the system CA pool is used.
 	// +optional
