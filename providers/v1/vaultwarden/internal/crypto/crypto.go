@@ -179,6 +179,66 @@ func DecryptStringBytes(s string, encKey, macKey []byte) ([]byte, error) {
 	return Decrypt(es, encKey, macKey)
 }
 
+// attachmentEncType is the encryption-type byte that prefixes a Bitwarden
+// attachment blob. It is the binary equivalent of the "2." prefix on an
+// EncString (AesCbc256_HmacSha256).
+const attachmentEncType byte = 2
+
+// DecryptBlob decrypts a downloaded Bitwarden attachment blob.
+//
+// The bytes Vaultwarden serves from
+// GET /api/ciphers/{cipherId}/attachment/{attachmentId} are the binary form of
+// an EncString:
+//
+//	[1 byte encType][16 byte IV][32 byte HMAC][N byte ciphertext]
+//
+// with the HMAC computed over IV||CT, exactly as for the "2.iv|ct|mac" wire
+// string Decrypt consumes. The MAC is verified before decryption and every
+// failure returns the same error, preserving the padding-oracle protection that
+// Decrypt provides.
+//
+// The caller selects the keys: the per-attachment key for "v2" attachments (a
+// 64-byte value the cipher carries, itself encrypted with the cipher key), or
+// the cipher's own enc/mac keys for "v1" attachments.
+func DecryptBlob(blob, encKey, macKey []byte) ([]byte, error) {
+	const headerLen = 1 + aes.BlockSize + sha256.Size
+	if len(blob) < headerLen {
+		return nil, errInvalidCiphertext
+	}
+	if blob[0] != attachmentEncType {
+		return nil, errInvalidCiphertext
+	}
+	es := EncString{
+		Type: blob[0],
+		IV:   blob[1 : 1+aes.BlockSize],
+		MAC:  blob[1+aes.BlockSize : headerLen],
+		CT:   blob[headerLen:],
+	}
+	return Decrypt(es, encKey, macKey)
+}
+
+// Encrypt is the inverse of DecryptBlob's container format: it packs plaintext
+// into the binary attachment blob layout ([encType][IV][MAC][CT]) using the
+// given enc/mac keys. Vaultwarden itself writes this container; the helper
+// exists so callers and tests can produce a blob without the textual EncString
+// wrapper.
+func EncryptBlob(plaintext, encKey, macKey []byte) ([]byte, error) {
+	s, err := Encrypt(plaintext, encKey, macKey)
+	if err != nil {
+		return nil, err
+	}
+	es, err := ParseEncString(s)
+	if err != nil {
+		return nil, err
+	}
+	blob := make([]byte, 0, 1+len(es.IV)+len(es.MAC)+len(es.CT))
+	blob = append(blob, attachmentEncType)
+	blob = append(blob, es.IV...)
+	blob = append(blob, es.MAC...)
+	blob = append(blob, es.CT...)
+	return blob, nil
+}
+
 // Encrypt encrypts plaintext using AES-256-CBC + HMAC-SHA256 and returns a Bitwarden EncString.
 func Encrypt(plaintext, encKey, macKey []byte) (string, error) {
 	iv := make([]byte, aes.BlockSize)
