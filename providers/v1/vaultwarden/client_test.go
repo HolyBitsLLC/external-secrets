@@ -22,19 +22,20 @@ import "testing"
 
 func TestFilterCiphersByScope(t *testing.T) {
 	ciphers := []vaultwardenCipher{
-		{ID: "p1", Type: 1, OrganizationID: nil},                                            // personal Login
-		{ID: "p2", Type: 2, OrganizationID: nil},                                            // personal SecureNote
-		{ID: "o1", Type: 1, OrganizationID: "uuid-a"},                                       // org A Login
-		{ID: "o2", Type: 2, OrganizationID: "uuid-b"},                                       // org B SecureNote
-		{ID: "deleted", Type: 1, OrganizationID: nil, DeletedDate: "2026-01-01T00:00:00Z"},  // deleted
-		{ID: "unsupported", Type: 5, OrganizationID: nil},                                   // not Login or SecureNote
+		{ID: "p1", Type: 1, OrganizationID: nil},                                           // personal Login
+		{ID: "p2", Type: 2, OrganizationID: nil},                                           // personal SecureNote
+		{ID: "p3", Type: 5, OrganizationID: nil},                                           // personal SSH key
+		{ID: "o1", Type: 1, OrganizationID: "uuid-a"},                                      // org A Login
+		{ID: "o2", Type: 2, OrganizationID: "uuid-b"},                                      // org B SecureNote
+		{ID: "deleted", Type: 1, OrganizationID: nil, DeletedDate: "2026-01-01T00:00:00Z"}, // deleted
+		{ID: "unsupported", Type: 3, OrganizationID: nil},                                  // Card: not a supported type
 	}
 
-	// Personal scope: only p1, p2 (no deleted, no unsupported type).
+	// Personal scope: only p1, p2, p3 (no deleted, no unsupported type).
 	got := filterCiphersByScope(ciphers, "")
 	gotIDs := cipherIDs(got)
-	if !equalStringSlice(gotIDs, []string{"p1", "p2"}) {
-		t.Fatalf("personal scope: got %v want [p1 p2]", gotIDs)
+	if !equalStringSlice(gotIDs, []string{"p1", "p2", "p3"}) {
+		t.Fatalf("personal scope: got %v want [p1 p2 p3]", gotIDs)
 	}
 
 	// Org A scope: only o1.

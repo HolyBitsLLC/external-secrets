@@ -44,11 +44,14 @@ type fakeVault struct {
 	calls       map[string]int
 	ciphers     []vaultwardenCipher
 	collections []collectionEntry
+	// attachments maps "cipherID/attachmentID" to the raw (still encrypted)
+	// blob the server would serve; a missing key yields 404.
+	attachments map[string][]byte
 }
 
 func newFakeVault(t *testing.T) *fakeVault {
 	t.Helper()
-	f := &fakeVault{calls: map[string]int{}}
+	f := &fakeVault{calls: map[string]int{}, attachments: map[string][]byte{}}
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /api/sync", func(w http.ResponseWriter, _ *http.Request) {
@@ -57,6 +60,20 @@ func newFakeVault(t *testing.T) *fakeVault {
 		resp := syncResponse{Ciphers: f.ciphers, Collections: f.collections}
 		f.mu.Unlock()
 		writeJSON(t, w, resp)
+	})
+	mux.HandleFunc("GET /api/ciphers/{id}/attachment/{attID}", func(w http.ResponseWriter, r *http.Request) {
+		f.inc("attachment")
+		f.mu.Lock()
+		blob, ok := f.attachments[r.PathValue("id")+"/"+r.PathValue("attID")]
+		f.mu.Unlock()
+		if !ok {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		w.Header().Set("Content-Type", "application/octet-stream")
+		if _, err := w.Write(blob); err != nil {
+			t.Errorf("fake vault: writing attachment: %v", err)
+		}
 	})
 	mux.HandleFunc("POST /api/ciphers", func(w http.ResponseWriter, _ *http.Request) {
 		f.inc("create")
@@ -107,6 +124,14 @@ func (f *fakeVault) setCollections(collections ...collectionEntry) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.collections = collections
+}
+
+// setAttachment registers the raw (still encrypted) blob the fake server serves
+// for a given cipher/attachment pair.
+func (f *fakeVault) setAttachment(cipherID, attachmentID string, blob []byte) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.attachments[cipherID+"/"+attachmentID] = blob
 }
 
 // testKeys are the deterministic symmetric key bytes every harness client uses.
@@ -196,6 +221,59 @@ func fieldCipher(t *testing.T, id, name, field, value string) vaultwardenCipher 
 			Type:  0,
 		}},
 	}
+}
+
+// loginUserCipher builds a Login item with both username and password set.
+func loginUserCipher(t *testing.T, id, name, username, password string) vaultwardenCipher {
+	t.Helper()
+	return vaultwardenCipher{
+		ID:   id,
+		Type: cipherTypeLogin,
+		Name: enc(t, name, testEncKey, testMacKey),
+		Login: &cipherLogin{
+			Username: enc(t, username, testEncKey, testMacKey),
+			Password: enc(t, password, testEncKey, testMacKey),
+		},
+	}
+}
+
+// sshCipher builds a type-5 SSH-key item. Empty optional fields are omitted, so
+// a caller can exercise the "field absent" path by passing "".
+func sshCipher(t *testing.T, id, name, priv, pub, fingerprint string) vaultwardenCipher {
+	t.Helper()
+	key := &cipherSSHKey{}
+	if priv != "" {
+		key.PrivateKey = enc(t, priv, testEncKey, testMacKey)
+	}
+	if pub != "" {
+		key.PublicKey = enc(t, pub, testEncKey, testMacKey)
+	}
+	if fingerprint != "" {
+		key.KeyFingerprint = enc(t, fingerprint, testEncKey, testMacKey)
+	}
+	return vaultwardenCipher{
+		ID:     id,
+		Type:   cipherTypeSSHKey,
+		Name:   enc(t, name, testEncKey, testMacKey),
+		SSHKey: key,
+	}
+}
+
+// addAttachment appends an attachment to a cipher. When perAttachmentKey is nil
+// the attachment is a legacy "v1" one (no Key field) and is encrypted directly
+// with the cipher key; otherwise the given 64-byte key material is wrapped in a
+// Key EncString, producing a "v2" attachment.
+func addAttachment(c *vaultwardenCipher, t *testing.T, attID, fileName string, perAttachmentKey []byte) {
+	t.Helper()
+	att := cipherAttachment{
+		ID:       attID,
+		FileName: enc(t, fileName, testEncKey, testMacKey),
+		Size:     "0",
+	}
+	if perAttachmentKey != nil {
+		att.Key = enc(t, string(perAttachmentKey), testEncKey, testMacKey)
+	}
+	c.Attachments = append(c.Attachments, att)
 }
 
 // stubPushSecretData implements esv1.PushSecretData for tests.
