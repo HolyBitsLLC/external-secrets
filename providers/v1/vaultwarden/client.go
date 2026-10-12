@@ -24,6 +24,7 @@ import (
 	"crypto/rsa"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"regexp"
 	"sort"
@@ -39,20 +40,49 @@ import (
 	"github.com/external-secrets/external-secrets/providers/v1/vaultwarden/internal/crypto"
 )
 
+// Vaultwarden/Bitwarden cipher type discriminators. Only the types the read
+// path understands are listed; the scope filter drops everything else.
+const (
+	cipherTypeLogin      = 1
+	cipherTypeSecureNote = 2
+	cipherTypeSSHKey     = 5
+)
+
 // vaultwardenCipher represents a vault item returned from /api/ciphers or /api/sync.
 type vaultwardenCipher struct {
-	ID             string        `json:"id"`
-	Type           int           `json:"type"`  // 1=Login, 2=SecureNote
-	Name           string        `json:"name"`  // EncString
-	Notes          string        `json:"notes"` // EncString (may be empty)
-	Login          *cipherLogin  `json:"login"`
-	Fields         []cipherField `json:"fields"`
-	DeletedDate    interface{}   `json:"deletedDate"`
-	OrganizationID interface{}   `json:"organizationId"` // nil=personal, string UUID=org
+	ID             string             `json:"id"`
+	Type           int                `json:"type"`  // see cipherType* constants
+	Name           string             `json:"name"`  // EncString
+	Notes          string             `json:"notes"` // EncString (may be empty)
+	Login          *cipherLogin       `json:"login"`
+	SSHKey         *cipherSSHKey      `json:"sshKey"` // present only on cipherTypeSSHKey items
+	Fields         []cipherField      `json:"fields"`
+	Attachments    []cipherAttachment `json:"attachments"`
+	DeletedDate    interface{}        `json:"deletedDate"`
+	OrganizationID interface{}        `json:"organizationId"` // nil=personal, string UUID=org
 	// CollectionIDs are the organization collections this item belongs to.
 	// Null/absent for personal items.
 	CollectionIDs []string `json:"collectionIds"`
 }
+
+// loginPropertyUsername and loginPropertyPassword are the remoteRef.property
+// names that select a login cipher's username/password, reproducing the
+// `bitwarden-login` webhook store's `$.data.login.<property>` addressing.
+const (
+	loginPropertyUsername = "username"
+	loginPropertyPassword = "password"
+)
+
+// sshProperty* are the remoteRef.property names that select an SSH-key cipher's
+// fields, reproducing the `bitwarden-ssh` webhook store's `$.data.sshKey.*`
+// addressing. keyFingerprint is the Vaultwarden API field name; fingerprint is
+// accepted as an alias because the store's consumers use both.
+const (
+	sshPropertyPrivateKey     = "privateKey"
+	sshPropertyPublicKey      = "publicKey"
+	sshPropertyKeyFingerprint = "keyFingerprint"
+	sshPropertyFingerprint    = "fingerprint"
+)
 
 type cipherLogin struct {
 	Password string `json:"password"` // EncString
@@ -63,6 +93,28 @@ type cipherField struct {
 	Name  string `json:"name"`  // EncString
 	Value string `json:"value"` // EncString
 	Type  int    `json:"type"`  // 0=text
+}
+
+// cipherSSHKey is the `sshKey` object carried by a type-5 (SSH Key) cipher.
+// All three fields are EncStrings; publicKey and keyFingerprint are optional.
+type cipherSSHKey struct {
+	PrivateKey     string `json:"privateKey"`     // EncString
+	PublicKey      string `json:"publicKey"`      // EncString (optional)
+	KeyFingerprint string `json:"keyFingerprint"` // EncString (optional)
+}
+
+// cipherAttachment describes a file attached to a cipher.
+//
+// Key, when non-empty, is the "v2" per-attachment symmetric key: an EncString
+// (encrypted with the cipher key) whose plaintext is the 64-byte AES-enc ‖
+// HMAC-mac key pair used for that blob. Legacy "v1" attachments leave it empty
+// and are encrypted directly with the cipher key.
+type cipherAttachment struct {
+	ID       string `json:"id"`
+	URL      string `json:"url"`
+	FileName string `json:"fileName"` // EncString
+	Size     string `json:"size"`
+	Key      string `json:"key"` // EncString, v2 only
 }
 
 type ciphersListResponse struct {
@@ -90,17 +142,17 @@ func cipherOrgID(c vaultwardenCipher) string {
 	return ""
 }
 
-// filterCiphersByScope keeps only Login + SecureNote ciphers in the
-// configured scope. orgID == "" means personal-only (org ciphers are
-// dropped). orgID != "" means only that org's ciphers (personal items
-// are dropped). Deleted ciphers are always dropped.
+// filterCiphersByScope keeps only the cipher types the read path understands —
+// Login, SecureNote and SSH Key — in the configured scope. orgID == "" means
+// personal-only (org ciphers are dropped). orgID != "" means only that org's
+// ciphers (personal items are dropped). Deleted ciphers are always dropped.
 func filterCiphersByScope(ciphers []vaultwardenCipher, orgID string) []vaultwardenCipher {
 	out := make([]vaultwardenCipher, 0, len(ciphers))
 	for _, c := range ciphers {
 		if c.DeletedDate != nil {
 			continue
 		}
-		if c.Type != 1 && c.Type != 2 {
+		if c.Type != cipherTypeLogin && c.Type != cipherTypeSecureNote && c.Type != cipherTypeSSHKey {
 			continue
 		}
 		cOrg := cipherOrgID(c)
@@ -263,7 +315,23 @@ func (c *Client) GetSecret(ctx context.Context, ref esv1.ExternalSecretDataRemot
 	}
 	var out []byte
 	if ref.Property != "" {
-		out, err = getCipherProperty(cipher, ref.Property, t)
+		var found bool
+		out, found, err = resolveCipherProperty(cipher, ref.Property, t)
+		if err != nil {
+			return nil, err
+		}
+		if !found {
+			// Not a custom field, built-in property or notes-JSON key: the
+			// property may name a cipher attachment (the `bitwarden-attachments`
+			// store addresses attachments by decrypted filename via
+			// remoteRef.property). Attachments are fetched and decrypted here
+			// because that needs the HTTP client, which the pure property
+			// resolvers do not have.
+			out, err = c.getAttachmentSecret(ctx, accessToken, cipher, ref.Property, t)
+			if err != nil {
+				return nil, err
+			}
+		}
 	} else {
 		out, err = getCipherValue(cipher, ref.Key, t)
 	}
@@ -274,9 +342,20 @@ func (c *Client) GetSecret(ctx context.Context, ref esv1.ExternalSecretDataRemot
 	return out, nil
 }
 
-// getCipherProperty looks up a named property from a cipher's custom fields,
-// falling back to the cipher's Notes JSON for secrets written by this provider.
-func getCipherProperty(cipher *vaultwardenCipher, property string, t *cachedToken) ([]byte, error) {
+// resolveCipherProperty resolves a remoteRef.property to its plaintext value.
+//
+// Precedence is deliberate and preserves the provider's historical behaviour:
+//
+//  1. a custom field whose decrypted name equals the property — this is how the
+//     `bitwarden-fields` store addresses items and it must keep winning;
+//  2. a built-in structural property of the cipher type — login `username` /
+//     `password` and SSH-key `privateKey` / `publicKey` / `keyFingerprint`
+//     (or its `fingerprint` alias);
+//  3. a key inside the decrypted Notes JSON — the shape PushSecret writes.
+//
+// found is false (with a nil error) when nothing matched, so that GetSecret can
+// fall back to the attachment lookup before reporting the property missing.
+func resolveCipherProperty(cipher *vaultwardenCipher, property string, t *cachedToken) ([]byte, bool, error) {
 	enc, mac := t.keysFor(*cipher)
 	for _, f := range cipher.Fields {
 		name, err := crypto.DecryptString(f.Name, enc, mac)
@@ -286,15 +365,70 @@ func getCipherProperty(cipher *vaultwardenCipher, property string, t *cachedToke
 		if name == property {
 			val, err := crypto.DecryptString(f.Value, enc, mac)
 			if err != nil {
-				return nil, fmt.Errorf("vaultwarden: decrypting field value: %w", err)
+				return nil, false, fmt.Errorf("vaultwarden: decrypting field value: %w", err)
 			}
-			return []byte(val), nil
+			return []byte(val), true, nil
 		}
 	}
-	if v := getCipherPropertyFromNotes(cipher, property, t); v != nil {
-		return v, nil
+	if v, found, err := builtinCipherProperty(cipher, property, t); err != nil || found {
+		return v, found, err
 	}
-	return nil, fmt.Errorf("vaultwarden: field %q not found in secret %q", property, cipher.Name)
+	if v := getCipherPropertyFromNotes(cipher, property, t); v != nil {
+		return v, true, nil
+	}
+	return nil, false, nil
+}
+
+// builtinCipherProperty resolves the structural properties of a cipher type,
+// mirroring how the webhook stores reach into the item JSON
+// (`$.data.login.username`, `$.data.sshKey.privateKey`, ...). A property that
+// does not apply to the cipher type — or whose field is absent/empty — reports
+// found=false so the caller can keep looking.
+func builtinCipherProperty(cipher *vaultwardenCipher, property string, t *cachedToken) ([]byte, bool, error) {
+	enc, mac := t.keysFor(*cipher)
+	switch property {
+	case loginPropertyUsername:
+		if cipher.Login == nil {
+			return nil, false, nil
+		}
+		return decryptOptional(cipher.Login.Username, enc, mac, "username")
+	case loginPropertyPassword:
+		if cipher.Login == nil {
+			return nil, false, nil
+		}
+		return decryptOptional(cipher.Login.Password, enc, mac, "password")
+	case sshPropertyPrivateKey:
+		if cipher.SSHKey == nil {
+			return nil, false, nil
+		}
+		return decryptOptional(cipher.SSHKey.PrivateKey, enc, mac, "private key")
+	case sshPropertyPublicKey:
+		if cipher.SSHKey == nil {
+			return nil, false, nil
+		}
+		return decryptOptional(cipher.SSHKey.PublicKey, enc, mac, "public key")
+	case sshPropertyKeyFingerprint, sshPropertyFingerprint:
+		if cipher.SSHKey == nil {
+			return nil, false, nil
+		}
+		return decryptOptional(cipher.SSHKey.KeyFingerprint, enc, mac, "key fingerprint")
+	default:
+		return nil, false, nil
+	}
+}
+
+// decryptOptional decrypts a field that may legitimately be empty (Vaultwarden
+// omits optional fields such as sshKey.publicKey). An empty ciphertext is
+// "absent", not an error.
+func decryptOptional(encString string, enc, mac []byte, label string) ([]byte, bool, error) {
+	if encString == "" {
+		return nil, false, nil
+	}
+	val, err := crypto.DecryptString(encString, enc, mac)
+	if err != nil {
+		return nil, false, fmt.Errorf("vaultwarden: decrypting %s: %w", label, err)
+	}
+	return []byte(val), true, nil
 }
 
 // getCipherPropertyFromNotes attempts to extract a property from Notes JSON.
@@ -317,30 +451,169 @@ func getCipherPropertyFromNotes(cipher *vaultwardenCipher, property string, t *c
 	return nil
 }
 
-// getCipherValue returns the primary value of a cipher:
-// Notes for SecureNote (type 2), password for Login (type 1).
+// getCipherValue returns the primary value of a cipher when no
+// remoteRef.property is set: notes for a SecureNote, the password for a Login,
+// and the private key for an SSH-key item.
 func getCipherValue(cipher *vaultwardenCipher, key string, t *cachedToken) ([]byte, error) {
 	enc, mac := t.keysFor(*cipher)
-	if cipher.Type == 2 {
-		val, err := crypto.DecryptString(cipher.Notes, enc, mac)
-		if err != nil {
-			return nil, fmt.Errorf("vaultwarden: decrypting notes: %w", err)
-		}
-		return []byte(val), nil
+	encString, label, ok := primaryCipherEncValue(cipher)
+	if !ok {
+		return nil, fmt.Errorf("vaultwarden: secret %q has no usable value", key)
 	}
-	if cipher.Login != nil {
-		val, err := crypto.DecryptString(cipher.Login.Password, enc, mac)
-		if err != nil {
-			return nil, fmt.Errorf("vaultwarden: decrypting password: %w", err)
-		}
-		return []byte(val), nil
+	val, err := crypto.DecryptString(encString, enc, mac)
+	if err != nil {
+		return nil, fmt.Errorf("vaultwarden: decrypting %s: %w", label, err)
 	}
-	return nil, fmt.Errorf("vaultwarden: secret %q has no usable value", key)
+	return []byte(val), nil
+}
+
+// primaryCipherEncValue returns the EncString holding a cipher's primary value
+// and a human-readable label for error messages. ok is false when the cipher
+// carries no primary value in a form the read path understands. An empty
+// EncString is returned with ok=true for a present-but-empty field, preserving
+// the historical behaviour of yielding empty bytes rather than an error.
+func primaryCipherEncValue(cipher *vaultwardenCipher) (encString, label string, ok bool) {
+	switch cipher.Type {
+	case cipherTypeSecureNote:
+		return cipher.Notes, "notes", true
+	case cipherTypeSSHKey:
+		if cipher.SSHKey != nil {
+			return cipher.SSHKey.PrivateKey, "private key", true
+		}
+		return "", "", false
+	default:
+		if cipher.Login != nil {
+			return cipher.Login.Password, "password", true
+		}
+		return "", "", false
+	}
+}
+
+// maxAttachmentBytes bounds an attachment download so a hostile or misconfigured
+// server cannot exhaust controller memory.
+const maxAttachmentBytes = 64 << 20 // 64 MiB
+
+// getAttachmentSecret resolves `ref` to a cipher attachment and returns its
+// decrypted bytes. `ref` matches the attachment id exactly, or else the
+// attachment's decrypted filename — which is how the `bitwarden-attachments`
+// store addresses files via remoteRef.property. A filename shared by more than
+// one attachment is an error (never a silent pick), consistent with
+// ambiguousRefError for ciphers.
+func (c *Client) getAttachmentSecret(ctx context.Context, accessToken string, cipher *vaultwardenCipher, ref string, t *cachedToken) ([]byte, error) {
+	att, err := findAttachment(cipher, ref, t)
+	if err != nil {
+		return nil, err
+	}
+
+	// Start from the cipher's own keys, then swap in the "v2" per-attachment
+	// key when the cipher carries one.
+	blobEnc, blobMac := t.keysFor(*cipher)
+	if att.Key != "" {
+		raw, err := crypto.DecryptStringBytes(att.Key, blobEnc, blobMac)
+		if err != nil {
+			return nil, fmt.Errorf("vaultwarden: decrypting attachment key for %q: %w", ref, err)
+		}
+		if len(raw) != 64 {
+			return nil, fmt.Errorf("vaultwarden: attachment key for %q has length %d, want 64", ref, len(raw))
+		}
+		blobEnc, blobMac = raw[:32], raw[32:]
+	}
+
+	blob, err := c.downloadAttachment(ctx, accessToken, cipher.ID, att.ID)
+	if err != nil {
+		return nil, err
+	}
+	plaintext, err := crypto.DecryptBlob(blob, blobEnc, blobMac)
+	if err != nil {
+		return nil, fmt.Errorf("vaultwarden: decrypting attachment %q: %w", ref, err)
+	}
+	return plaintext, nil
+}
+
+// findAttachment resolves an attachment reference by id or decrypted filename.
+func findAttachment(cipher *vaultwardenCipher, ref string, t *cachedToken) (*cipherAttachment, error) {
+	for i := range cipher.Attachments {
+		if cipher.Attachments[i].ID == ref {
+			return &cipher.Attachments[i], nil
+		}
+	}
+	enc, mac := t.keysFor(*cipher)
+	var matches []*cipherAttachment
+	for i := range cipher.Attachments {
+		name, err := crypto.DecryptString(cipher.Attachments[i].FileName, enc, mac)
+		if err != nil {
+			continue
+		}
+		if name == ref {
+			matches = append(matches, &cipher.Attachments[i])
+		}
+	}
+	switch len(matches) {
+	case 0:
+		label := cipher.ID
+		if name, ok := cipherName(cipher, t); ok {
+			label = name
+		}
+		return nil, fmt.Errorf("vaultwarden: field %q not found in secret %q (no such custom field, notes key or attachment)", ref, label)
+	case 1:
+		return matches[0], nil
+	default:
+		ids := make([]string, 0, len(matches))
+		for _, m := range matches {
+			ids = append(ids, m.ID)
+		}
+		sort.Strings(ids)
+		label := cipher.ID
+		if name, ok := cipherName(cipher, t); ok {
+			label = name
+		}
+		return nil, fmt.Errorf("vaultwarden: more than one attachment on secret %q is named %q (candidates: %s); use one of the candidate ids as remoteRef.property",
+			label, ref, strings.Join(ids, ", "))
+	}
+}
+
+// downloadAttachment fetches the raw, still-encrypted attachment blob from
+// GET /api/ciphers/{cipherId}/attachment/{attachmentId}. That endpoint serves
+// the bytes directly for local storage and redirects (followed transparently by
+// http.Client) when the server delegates to object storage, so the cipher's
+// pre-signed attachment URL is not used directly.
+func (c *Client) downloadAttachment(ctx context.Context, accessToken, cipherID, attachmentID string) ([]byte, error) {
+	url := fmt.Sprintf("%s/api/ciphers/%s/attachment/%s", strings.TrimRight(c.provider.URL, "/"), cipherID, attachmentID)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return nil, fmt.Errorf("vaultwarden: building attachment request: %w", err)
+	}
+	req.Header.Set("Authorization", bearerPrefix+accessToken)
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("vaultwarden: downloading attachment: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("vaultwarden: attachment download returned status %d", resp.StatusCode)
+	}
+	blob, err := io.ReadAll(io.LimitReader(resp.Body, maxAttachmentBytes+1))
+	if err != nil {
+		return nil, fmt.Errorf("vaultwarden: reading attachment: %w", err)
+	}
+	if len(blob) > maxAttachmentBytes {
+		return nil, fmt.Errorf("vaultwarden: attachment exceeds %d bytes", maxAttachmentBytes)
+	}
+	return blob, nil
 }
 
 // GetSecretMap returns a map of keys to values by parsing the cipher's decrypted notes as JSON.
 // The whole map is cached as one entry (cacheKindMap). ref.Property is ignored
 // by this provider, so it is not part of the cache key.
+//
+// When a cipher has no notes, the map is built from its structural fields
+// instead (login username/password, SSH privateKey/publicKey/keyFingerprint).
+// Notes, when present, always win so the historical notes-JSON contract is
+// unchanged; attachment bytes are never auto-expanded into a map because a
+// cipher may hold arbitrarily many large blobs — read them individually with
+// GetSecret and remoteRef.property set to the attachment filename.
 func (c *Client) GetSecretMap(ctx context.Context, ref esv1.ExternalSecretDataRemoteRef) (map[string][]byte, error) {
 	cacheKey := secretCacheKey(ref.Key, cacheKindMap, "")
 	if m, ok := c.cacheGetMap(cacheKey); ok {
@@ -363,7 +636,12 @@ func (c *Client) GetSecretMap(ctx context.Context, ref esv1.ExternalSecretDataRe
 	}
 
 	if cipher.Notes == "" {
-		return nil, fmt.Errorf("vaultwarden: secret %q has empty notes; cannot produce map", ref.Key)
+		out, err := structuralCipherMap(cipher, ref.Key, t)
+		if err != nil {
+			return nil, err
+		}
+		c.cacheAddMap(cacheKey, out)
+		return out, nil
 	}
 
 	enc, mac := t.keysFor(*cipher)
@@ -382,6 +660,38 @@ func (c *Client) GetSecretMap(ctx context.Context, ref esv1.ExternalSecretDataRe
 		out[k] = jsonRawToBytes(v)
 	}
 	c.cacheAddMap(cacheKey, out)
+	return out, nil
+}
+
+// structuralCipherMap builds a name→value map from a cipher's built-in
+// properties when it has no notes JSON to parse. Login items yield username and
+// password; SSH-key items yield privateKey, publicKey and keyFingerprint.
+// Optional fields that are absent are omitted rather than emitted empty. A
+// cipher with no structural fields produces an error, so a caller never
+// silently receives an empty secret.
+func structuralCipherMap(cipher *vaultwardenCipher, key string, t *cachedToken) (map[string][]byte, error) {
+	props := []string{loginPropertyUsername, loginPropertyPassword}
+	if cipher.Type == cipherTypeSSHKey || cipher.SSHKey != nil {
+		props = []string{
+			sshPropertyPrivateKey,
+			sshPropertyPublicKey,
+			sshPropertyKeyFingerprint,
+		}
+	}
+
+	out := make(map[string][]byte)
+	for _, p := range props {
+		v, found, err := builtinCipherProperty(cipher, p, t)
+		if err != nil {
+			return nil, err
+		}
+		if found && len(v) > 0 {
+			out[p] = v
+		}
+	}
+	if len(out) == 0 {
+		return nil, fmt.Errorf("vaultwarden: secret %q has empty notes and no readable built-in fields; cannot produce map", key)
+	}
 	return out, nil
 }
 
@@ -439,16 +749,17 @@ func decryptCipherEntry(cipher *vaultwardenCipher, nameRe *regexp.Regexp, t *cac
 	return name, []byte(val), true
 }
 
-// decryptCipherPrimaryValue returns the primary plaintext value of a cipher.
+// decryptCipherPrimaryValue returns the primary plaintext value of a cipher:
+// notes for a SecureNote, the password for a Login and the private key for an
+// SSH-key item. An empty result is not an error, matching the historical
+// behaviour for present-but-empty fields.
 func decryptCipherPrimaryValue(cipher *vaultwardenCipher, t *cachedToken) (string, error) {
+	encString, _, ok := primaryCipherEncValue(cipher)
+	if !ok {
+		return "", nil
+	}
 	enc, mac := t.keysFor(*cipher)
-	if cipher.Type == 2 {
-		return crypto.DecryptString(cipher.Notes, enc, mac)
-	}
-	if cipher.Login != nil {
-		return crypto.DecryptString(cipher.Login.Password, enc, mac)
-	}
-	return "", nil
+	return crypto.DecryptString(encString, enc, mac)
 }
 
 // PushSecret writes a secret value to Vaultwarden as a SecureNote cipher.

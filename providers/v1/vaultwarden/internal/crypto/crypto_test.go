@@ -213,3 +213,53 @@ func TestPaddingOracleSafety(t *testing.T) {
 		t.Fatalf("padding error must match MAC error string;\n  got:  %q\n  want: %q", err.Error(), genericCiphertextErr)
 	}
 }
+
+// TestEncryptDecryptBlobRoundTrip verifies the binary attachment container
+// round-trips through EncryptBlob/DecryptBlob.
+func TestEncryptDecryptBlobRoundTrip(t *testing.T) {
+	encKey, macKey := deterministicTestKeys()
+	want := []byte("a PEM-encoded private key\n")
+
+	blob, err := EncryptBlob(want, encKey, macKey)
+	require.NoError(t, err)
+	require.Equal(t, byte(2), blob[0], "blob must carry the type-2 header byte")
+	require.Zero(t, (len(blob)-49)%16, "ciphertext must be AES-block aligned")
+
+	got, err := DecryptBlob(blob, encKey, macKey)
+	require.NoError(t, err)
+	assert.Equal(t, want, got)
+}
+
+// TestDecryptBlobRejectsWrongKey verifies a MAC mismatch fails with the generic
+// ciphertext error, so the attachment path keeps the padding-oracle protection.
+func TestDecryptBlobRejectsWrongKey(t *testing.T) {
+	encKey, macKey := deterministicTestKeys()
+	blob, err := EncryptBlob([]byte("payload"), encKey, macKey)
+	require.NoError(t, err)
+
+	otherMac := append([]byte(nil), macKey...)
+	otherMac[0] ^= 0xFF
+
+	_, err = DecryptBlob(blob, encKey, otherMac)
+	require.Error(t, err)
+	assert.Equal(t, genericCiphertextErr, err.Error())
+}
+
+// TestDecryptBlobRejectsMalformed covers the short-blob and wrong-header cases.
+func TestDecryptBlobRejectsMalformed(t *testing.T) {
+	encKey, macKey := deterministicTestKeys()
+
+	for _, tc := range []struct {
+		name string
+		blob []byte
+	}{
+		{"too short", []byte{0x02, 0x00}},
+		{"wrong enc type", append([]byte{0x00}, make([]byte, 64)...)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := DecryptBlob(tc.blob, encKey, macKey)
+			require.Error(t, err)
+			assert.Equal(t, genericCiphertextErr, err.Error())
+		})
+	}
+}
