@@ -135,39 +135,3 @@ jobs:
           flags: unittests
           file: ./cover.out
 
-  publish-artifacts:
-    needs: detect-noop
-    if: needs.detect-noop.outputs.noop != 'true'
-    uses: ./.github/workflows/publish.yml
-    permissions:
-      contents: read  #actions/checkout
-      packages: write #for publishing artifacts
-      id-token: write #for keyless sign
-    strategy:
-      matrix:
-        include:
-        - dockerfile: "Dockerfile"
-          build-args: "CGO_ENABLED=0"
-          build-arch: "amd64 arm64 s390x ppc64le"
-          build-platform: "linux/amd64,linux/arm64,linux/s390x,linux/ppc64le"
-          tag-suffix: "" # distroless
-        - dockerfile: "Dockerfile.ubi"
-          build-args: "CGO_ENABLED=0"
-          build-arch: "amd64 arm64 ppc64le"
-          build-platform: "linux/amd64,linux/arm64,linux/ppc64le"
-          tag-suffix: "-ubi"
-        - dockerfile: "Dockerfile.ubi"
-          build-args: "CGO_ENABLED=0 GOEXPERIMENT=boringcrypto"
-          build-arch: "amd64 arm64 ppc64le"
-          build-platform: "linux/amd64,linux/arm64,linux/ppc64le"
-          tag-suffix: "-ubi-boringssl"
-    with:
-      dockerfile: ${{ matrix.dockerfile }}
-      tag-suffix: ${{ matrix.tag-suffix }}
-      image-name: ghcr.io/${{ github.repository }}
-      build-platform: ${{ matrix.build-platform }}
-      build-args: ${{ matrix.build-args }}
-      build-arch: ${{ matrix.build-arch }}
-      ref: ${{ github.ref }}
-    secrets:
-      IS_FORK: ${{ secrets.GHCR_USERNAME }} # this is just a secret to verify it is a fork or not, no other utility
